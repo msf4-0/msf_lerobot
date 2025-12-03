@@ -31,7 +31,7 @@ lerobot-find-port
 # Step 4: Run Lerobot Demo
 
 # Calibration
-It may request for calibration file. If no file exist or required to calibrate follow guideline on how to do calibration from [Lerobot](https://huggingface.co/docs/lerobot/so101?calibrate_leader=Command).
+It may request for calibration file before run teleoperation demo. If no file exist or required to calibrate follow guideline on how to do calibration from [Lerobot](https://huggingface.co/docs/lerobot/so101?calibrate_leader=Command).
 
 
 # Teleoperation Demo
@@ -52,25 +52,19 @@ When setup for teleoperation demo, Leader arm and follower arm can be setup side
 
 # Deploy Trained Policy Demo
 
-To run the Lerobot with trained AI model, run below command
+1. To run the Lerobot with trained AI model, run below command
 ```
-lerobot-record 
---robot.type=so101_follower 
---robot.port=<insert the Follower Arm COM port number> 
---robot.id=follower_one 
---robot.cameras "{bottom: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" 
---display_data=true 
---dataset.repo_id=<insert own repo_if/local>
---dataset.num_episodes=1 --dataset.episode_time_s=600 
---dataset.reset_time_s=60 
---dataset.single_task="Pickup and insert white block into cup" 
---policypath=C:\Users\User\Documents\reuben_ws\lerobot\outputs\train\act_mini_studio_block_in_cup_redo\checkpoints\last\pretrained_model 
---dataset.push_to_hub=false
+lerobot-record --robot.type=so101_follower --robot.port=COM16 --robot.id=follower_one --robot.cameras "{bottom: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" --display_data=true --dataset.repo_id=local/eval_pick-insert-blockV2 --dataset.num_episodes=1 --dataset.episode_time_s=600 --dataset.reset_time_s=60 --dataset.single_task="Pickup and insert white block into cup" --policy.path=C:\Users\User\Documents\reuben_ws\lerobot\outputs\train\act_mini_studio_block_in_cup_redo_update\checkpoints\last\pretrained_model --dataset.push_to_hub=false
 ```
 During demonstration, try to place the block at these positions. See image below.
 ![image info](media/WIN_20251016_11_55_46_Pro.jpg)
 
+2. To end the demonstration, press arrow '->' and wait until it exits.
+3. Before run the demonstration again, make sure to delete existing evaluation file from the cache. Find the file location here:
+C:\Users\User\.cache\huggingface\lerobot\local
+Refer below image
+![image info](media/Screenshot%202025-10-24%20110828.jpg)
 
 ## Lerobot
 
-![image info](media\lerobot-logo-light.png)
+![image info](media/lerobot-logo-light.png)
