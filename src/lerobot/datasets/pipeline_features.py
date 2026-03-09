@@ -63,6 +63,30 @@ PREFIXES_TO_STRIP = tuple(
     f"{token}." for const in (ACTION, OBS_STATE, OBS_IMAGES) for token in (const, const.split(".")[-1])
 )
 
+def _is_visual_observation_feature(key: str, value: Any, images_token: str) -> bool:
+    """Return True if an observation feature should be treated as visual (rgb/video/depth)."""
+    # Explicit key-based image namespace always wins.
+    if (
+        key.startswith(f"{OBS_IMAGES}.")
+        or key.startswith(f"{images_token}.")
+        or f".{images_token}." in key
+    ):
+        return True
+
+    # Legacy shorthand: tuple HWC
+    if isinstance(value, tuple) and len(value) == 3:
+        return True
+
+    # New/explicit schema: {"dtype": "...", "shape": (...)}
+    if isinstance(value, dict):
+        dtype = value.get("dtype")
+        shape = value.get("shape")
+        if dtype in {"image", "video", "depth"}:
+            return True
+        if isinstance(shape, tuple) and len(shape) == 3:
+            return True
+
+    return False
 
 def aggregate_pipeline_dataset_features(
     pipeline: DataProcessorPipeline,
@@ -105,16 +129,7 @@ def aggregate_pipeline_dataset_features(
         for key, value in feats.items():
             # 1. Categorize the feature.
             is_action = ptype == PipelineFeatureType.ACTION
-            # Observations are classified as images if their key matches image-related tokens or if the shape of the feature is 3.
-            # All other observations are treated as state.
-            is_image = not is_action and (
-                (isinstance(value, tuple) and len(value) == 3)
-                or (
-                    key.startswith(f"{OBS_IMAGES}.")
-                    or key.startswith(f"{images_token}.")
-                    or f".{images_token}." in key
-                )
-            )
+            is_image = not is_action and _is_visual_observation_feature(key, value, images_token)
 
             # 2. Apply filtering rules.
             if is_image and not use_videos:

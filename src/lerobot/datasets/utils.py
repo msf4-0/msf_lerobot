@@ -659,32 +659,116 @@ def _validate_feature_names(features: dict[str, dict]) -> None:
         raise ValueError(f"Feature names should not contain '/'. Found '/' in '{invalid_features}'.")
 
 
+# def hw_to_dataset_features(
+#     hw_features: dict[str, type | tuple], prefix: str, use_video: bool = True
+# ) -> dict[str, dict]:
+#     """Convert hardware-specific features to a LeRobot dataset feature dictionary.
+
+#     This function takes a dictionary describing hardware outputs (like joint states
+#     or camera image shapes) and formats it into the standard LeRobot feature
+#     specification.
+
+#     Args:
+#         hw_features (dict): Dictionary mapping feature names to their type (float for
+#             joints) or shape (tuple for images).
+#         prefix (str): The prefix to add to the feature keys (e.g., "observation"
+#             or "action").
+#         use_video (bool): If True, image features are marked as "video", otherwise "image".
+
+#     Returns:
+#         dict: A LeRobot features dictionary.
+#     """
+#     features = {}
+#     joint_fts = {
+#         key: ftype
+#         for key, ftype in hw_features.items()
+#         if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+#     }
+#     cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
+
+#     if joint_fts and prefix == ACTION:
+#         features[prefix] = {
+#             "dtype": "float32",
+#             "shape": (len(joint_fts),),
+#             "names": list(joint_fts),
+#         }
+
+#     if joint_fts and prefix == OBS_STR:
+#         features[f"{prefix}.state"] = {
+#             "dtype": "float32",
+#             "shape": (len(joint_fts),),
+#             "names": list(joint_fts),
+#         }
+
+#     for key, shape in cam_fts.items():
+#         features[f"{prefix}.images.{key}"] = {
+#             "dtype": "video" if use_video else "image",
+#             "shape": shape,
+#             "names": ["height", "width", "channels"],
+#         }
+
+#     _validate_feature_names(features)
+#     return features
+
 def hw_to_dataset_features(
-    hw_features: dict[str, type | tuple], prefix: str, use_video: bool = True
+    hw_features: dict[str, type | tuple | dict | PolicyFeature], prefix: str, use_video: bool = True
 ) -> dict[str, dict]:
     """Convert hardware-specific features to a LeRobot dataset feature dictionary.
 
-    This function takes a dictionary describing hardware outputs (like joint states
-    or camera image shapes) and formats it into the standard LeRobot feature
-    specification.
+    Supports:
+    - Scalar/state/action specs (`float`, or non-visual `PolicyFeature`)
+    - Legacy visual specs as tuple `(H, W, C)`
+    - Explicit visual specs as dict, e.g. `{"dtype": "depth", "shape": (H, W, 1)}`
 
     Args:
-        hw_features (dict): Dictionary mapping feature names to their type (float for
-            joints) or shape (tuple for images).
-        prefix (str): The prefix to add to the feature keys (e.g., "observation"
-            or "action").
-        use_video (bool): If True, image features are marked as "video", otherwise "image".
+        hw_features (dict): Dictionary mapping feature names to their schema.
+        prefix (str): Feature namespace prefix (e.g. "observation" or "action").
+        use_video (bool): If True, RGB image features are marked as "video", else "image".
 
     Returns:
         dict: A LeRobot features dictionary.
     """
-    features = {}
+    features: dict[str, dict] = {}
+
     joint_fts = {
         key: ftype
         for key, ftype in hw_features.items()
-        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        if (
+            ftype is float
+            or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        )
     }
-    cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
+
+    # Visual features from tuple shorthand
+    cam_tuple_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple) and len(shape) == 3}
+
+    # Visual features from explicit dict schema
+    cam_dict_fts = {}
+    for key, spec in hw_features.items():
+        if not isinstance(spec, dict):
+            continue
+
+        dtype = spec.get("dtype")
+        shape = spec.get("shape")
+        is_visual_dtype = dtype in {"image", "video", "depth"}
+        is_visual_shape = isinstance(shape, tuple) and len(shape) == 3
+
+        if is_visual_dtype or is_visual_shape:
+            if not is_visual_shape:
+                raise ValueError(f"Visual feature '{key}' must provide a 3D shape tuple, got: {shape}")
+
+            # Resolve dtype:
+            # - preserve depth
+            # - map image/video according to use_video policy
+            if dtype == "depth":
+                resolved_dtype = "depth"
+            elif dtype in {"image", "video"}:
+                resolved_dtype = "video" if (dtype == "video" and use_video) else "image"
+            else:
+                # shape-only dict fallback
+                resolved_dtype = "video" if use_video else "image"
+
+            cam_dict_fts[key] = {"dtype": resolved_dtype, "shape": shape}
 
     if joint_fts and prefix == ACTION:
         features[prefix] = {
@@ -700,16 +784,22 @@ def hw_to_dataset_features(
             "names": list(joint_fts),
         }
 
-    for key, shape in cam_fts.items():
+    for key, shape in cam_tuple_fts.items():
         features[f"{prefix}.images.{key}"] = {
             "dtype": "video" if use_video else "image",
             "shape": shape,
             "names": ["height", "width", "channels"],
         }
 
+    for key, spec in cam_dict_fts.items():
+        features[f"{prefix}.images.{key}"] = {
+            "dtype": spec["dtype"],
+            "shape": spec["shape"],
+            "names": ["height", "width", "channels"],
+        }
+
     _validate_feature_names(features)
     return features
-
 
 def build_dataset_frame(
     ds_features: dict[str, dict], values: dict[str, Any], prefix: str

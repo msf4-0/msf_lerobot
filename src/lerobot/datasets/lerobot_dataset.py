@@ -16,7 +16,9 @@
 import concurrent.futures
 import contextlib
 import logging
+import os
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Callable
 from functools import partial
@@ -552,6 +554,61 @@ def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: in
     img_dir = (root / fpath).parent
     encode_video_frames(img_dir, temp_path, fps, overwrite=True)
     shutil.rmtree(img_dir)
+    return temp_path
+
+
+def _get_ffmpeg_executable() -> str:
+    """Resolve ffmpeg path with robust fallbacks.
+
+    Priority:
+    1) LEROBOT_FFMPEG_PATH env var
+    2) imageio-ffmpeg bundled binary (static, avoids missing system libs)
+    3) system ffmpeg on PATH
+    """
+    custom_ffmpeg = os.environ.get("LEROBOT_FFMPEG_PATH")
+    if custom_ffmpeg:
+        return custom_ffmpeg
+
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        return get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _encode_depth_video_worker_lossless(depth_key: str, episode_index: int, root: Path, fps: int) -> Path:
+    """Encode depth PNG sequence into a lossless FFV1 MKV video."""
+    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{depth_key}_{episode_index:03d}.mkv"
+    fpath = DEFAULT_IMAGE_PATH.format(image_key=depth_key, episode_index=episode_index, frame_index=0)
+    img_dir = (root / fpath).parent
+
+    cmd = [
+        _get_ffmpeg_executable(),
+        "-y",
+        "-framerate",
+        str(fps),
+        "-pattern_type",
+        "glob",
+        "-i",
+        str(img_dir / "*.png"),
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+        "-g",
+        "1",
+        "-pix_fmt",
+        "gray16le",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "ffmpeg executable not found. Install ffmpeg, or set LEROBOT_FFMPEG_PATH, "
+            "or `pip install imageio-ffmpeg`."
+        ) from exc
     return temp_path
 
 
@@ -1260,10 +1317,24 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._batch_save_episode_video(start_ep, end_ep)
                 self.episodes_since_last_encoding = 0
 
+        depth_archived = False
+        if len(self.meta.depth_keys) > 0:
+            try:
+                self._archive_episode_depth_videos(episode_index)
+                depth_archived = True
+            except Exception as exc:
+                logging.warning(
+                    "Depth lossless encoding failed; keeping depth PNGs for safety. "
+                    f"episode={episode_index}, error={exc}"
+                )
+
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
-            has_non_video_images = len(self.meta.image_keys) > 0 or len(self.meta.depth_keys) > 0
-            self.clear_episode_buffer(delete_images=has_non_video_images)
+            has_non_video_images = len(self.meta.image_keys) > 0
+            self.clear_episode_buffer(
+                delete_images=has_non_video_images,
+                delete_depth_images=depth_archived,
+            )
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """
@@ -1493,17 +1564,33 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return metadata
 
-    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+    def _archive_episode_depth_videos(self, episode_index: int) -> None:
+        """Archive each depth stream as a lossless FFV1 MKV file for this episode."""
+        for depth_key in self.meta.depth_keys:
+            temp_path = _encode_depth_video_worker_lossless(depth_key, episode_index, self.root, self.fps)
+            target_path = self.root / "depth_videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_path), str(target_path))
+            shutil.rmtree(str(temp_path.parent))
+
+    def clear_episode_buffer(self, delete_images: bool = True, delete_depth_images: bool = False) -> None:
         # Clean up image files for the current episode buffer
-        if delete_images:
+        if delete_images or delete_depth_images:
             # Wait for the async image writer to finish
             if self.image_writer is not None:
                 self._wait_image_writer()
             episode_index = self.episode_buffer["episode_index"]
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            # Clean up both image and depth keys (not video keys which are handled separately)
-            for cam_key in self.meta.image_keys + self.meta.depth_keys:
+
+            keys_to_delete = []
+            if delete_images:
+                keys_to_delete.extend(self.meta.image_keys)
+            if delete_depth_images:
+                keys_to_delete.extend(self.meta.depth_keys)
+
+            # Clean up image/depth frame directories (not encoded video directories)
+            for cam_key in keys_to_delete:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
