@@ -66,6 +66,7 @@ import gc
 import logging
 import time
 from pathlib import Path
+import cv2 
 
 import numpy as np
 import rerun as rr
@@ -85,6 +86,33 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     hwc_uint8_numpy = (chw_float32_torch * 255).type(torch.uint8).permute(1, 2, 0).numpy()
     return hwc_uint8_numpy
 
+def depth_to_turbo_hwc_uint8(
+    depth_torch: torch.Tensor,
+    depth_min: float | None = None,
+    depth_max: float | None = None,
+) -> np.ndarray:
+    """Convert depth tensor (1,H,W) or (H,W,1) to TURBO-colored uint8 HWC image."""
+    depth = depth_torch.detach().cpu().numpy()
+
+    if depth.ndim == 3 and depth.shape[0] == 1:
+        depth = depth[0]          # (1,H,W) -> (H,W)
+    elif depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]     # (H,W,1) -> (H,W)
+
+    if depth_min is None:
+        depth_min = float(np.nanmin(depth))
+    if depth_max is None:
+        depth_max = float(np.nanmax(depth))
+
+    # Avoid divide-by-zero
+    denom = max(depth_max - depth_min, 1e-12)
+    norm = np.clip((depth - depth_min) / denom, 0.0, 1.0)
+    gray_u8 = (norm * 255.0).astype(np.uint8)
+
+    # OpenCV returns BGR; convert to RGB for Rerun
+    bgr = cv2.applyColorMap(gray_u8, cv2.COLORMAP_TURBO)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return rgb
 
 def visualize_dataset(
     dataset: LeRobotDataset,
@@ -141,12 +169,20 @@ def visualize_dataset(
                 rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
 
             for key in dataset.meta.depth_keys:
+                depth_min = depth_max = None
                 if key in dataset.meta.stats:
                     depth_min = dataset.meta.stats[key]["min"].item()
                     depth_max = dataset.meta.stats[key]["max"].item()
+
+                # Keep raw depth (optional, useful for accurate inspection)
+                if depth_min is not None and depth_max is not None:
                     rr.log(key, rr.DepthImage(batch[key][i], depth_range=(depth_min, depth_max)))
                 else:
                     rr.log(key, rr.DepthImage(batch[key][i]))
+
+                # Log a colorized visualization stream
+                turbo = depth_to_turbo_hwc_uint8(batch[key][i], depth_min=depth_min, depth_max=depth_max)
+                rr.log(f"{key}/turbo", rr.Image(turbo))
 
             # display each dimension of action space (e.g. actuators command)
             if ACTION in batch:

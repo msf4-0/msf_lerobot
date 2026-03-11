@@ -1568,7 +1568,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """Archive each depth stream as a lossless FFV1 MKV file for this episode."""
         for depth_key in self.meta.depth_keys:
             temp_path = _encode_depth_video_worker_lossless(depth_key, episode_index, self.root, self.fps)
-            target_path = self.root / "depth_videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+            # target_path = self.root / "depth_videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+            target_path = self.root / "videos" / depth_key / f"episode-{episode_index:06d}.mkv"
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(temp_path), str(target_path))
             shutil.rmtree(str(temp_path.parent))
