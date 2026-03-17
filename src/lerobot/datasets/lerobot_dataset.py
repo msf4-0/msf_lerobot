@@ -72,11 +72,13 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import (
     VideoFrame,
     concatenate_video_files,
+    concatenate_depth_video_files,
     decode_video_frames,
     encode_video_frames,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
+    get_ffmpeg_executable,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -557,25 +559,6 @@ def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: in
     return temp_path
 
 
-def _get_ffmpeg_executable() -> str:
-    """Resolve ffmpeg path with robust fallbacks.
-
-    Priority:
-    1) LEROBOT_FFMPEG_PATH env var
-    2) imageio-ffmpeg bundled binary (static, avoids missing system libs)
-    3) system ffmpeg on PATH
-    """
-    custom_ffmpeg = os.environ.get("LEROBOT_FFMPEG_PATH")
-    if custom_ffmpeg:
-        return custom_ffmpeg
-
-    try:
-        from imageio_ffmpeg import get_ffmpeg_exe
-
-        return get_ffmpeg_exe()
-    except Exception:
-        return "ffmpeg"
-
 
 def _encode_depth_video_worker_lossless(depth_key: str, episode_index: int, root: Path, fps: int) -> Path:
     """Encode depth PNG sequence into a lossless FFV1 MKV video."""
@@ -584,7 +567,7 @@ def _encode_depth_video_worker_lossless(depth_key: str, episode_index: int, root
     img_dir = (root / fpath).parent
 
     cmd = [
-        _get_ffmpeg_executable(),
+        get_ffmpeg_executable(),
         "-y",
         "-framerate",
         str(fps),
@@ -1301,13 +1284,37 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     ep_metadata.update(
                         self._save_episode_video(video_key, episode_index, temp_path=temp_path)
                     )
+                
             else:
                 for video_key in self.meta.video_keys:
                     ep_metadata.update(self._save_episode_video(video_key, episode_index))
 
+        depth_archived = False
+        if len(self.meta.depth_keys) > 0:
+            for video_key in self.meta.depth_keys:
+                try:
+                    ep_metadata.update(self._archive_episode_depth_videos(episode_index, video_key=video_key))
+                    depth_archived = True
+                except Exception as exc:
+                    logging.warning(
+                        f"Depth lossless encoding failed for {video_key}; keeping depth PNGs for safety. "
+                        f"episode={episode_index}, error={exc}"
+                    )
+        # depth_archived = False
+        # if len(self.meta.depth_keys) > 0:
+        #     try:
+        #         self._archive_episode_depth_videos(episode_index)
+        #         depth_archived = True
+        #     except Exception as exc:
+        #         logging.warning(
+        #             "Depth lossless encoding failed; keeping depth PNGs for safety. "
+        #             f"episode={episode_index}, error={exc}"
+        #         )
+
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
 
+        # NOTE: batch encoding currently does not support depth video encoding
         if has_video_keys and use_batched_encoding:
             # Check if we should trigger batch encoding
             self.episodes_since_last_encoding += 1
@@ -1316,17 +1323,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 end_ep = self.num_episodes
                 self._batch_save_episode_video(start_ep, end_ep)
                 self.episodes_since_last_encoding = 0
-
-        depth_archived = False
-        if len(self.meta.depth_keys) > 0:
-            try:
-                self._archive_episode_depth_videos(episode_index)
-                depth_archived = True
-            except Exception as exc:
-                logging.warning(
-                    "Depth lossless encoding failed; keeping depth PNGs for safety. "
-                    f"episode={episode_index}, error={exc}"
-                )
 
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
@@ -1564,15 +1560,69 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return metadata
 
-    def _archive_episode_depth_videos(self, episode_index: int) -> None:
-        """Archive each depth stream as a lossless FFV1 MKV file for this episode."""
-        for depth_key in self.meta.depth_keys:
-            temp_path = _encode_depth_video_worker_lossless(depth_key, episode_index, self.root, self.fps)
-            # target_path = self.root / "depth_videos" / depth_key / f"episode-{episode_index:06d}.mkv"
-            target_path = self.root / "videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+    def _get_latest_depth_archive_path(self, depth_key: str) -> tuple[Path, int, int] | None:
+        depth_root = self.root / "videos" / depth_key
+        candidates = list(depth_root.glob("chunk-*/file-*.mkv"))
+        if not candidates:
+            return None
+
+        def _idxs(p: Path) -> tuple[int, int]:
+            chunk_idx = int(p.parent.name.split("-")[-1])
+            file_idx = int(p.stem.split("-")[-1])
+            return chunk_idx, file_idx
+
+        latest = max(candidates, key=_idxs)
+        c, f = _idxs(latest)
+        return latest, c, f
+    
+    def _archive_episode_depth_videos(self, episode_index: int, video_key: str) -> dict:
+        """Archive one depth stream as chunked lossless FFV1 MKV and return episode metadata."""
+        ep_path = _encode_depth_video_worker_lossless(video_key, episode_index, self.root, self.fps)
+        ep_size_in_mb = get_file_size_in_mb(ep_path)
+        ep_duration_in_s = get_video_duration_in_s(ep_path)
+
+        latest = self._get_latest_depth_archive_path(video_key)
+        if latest is None:
+            chunk_idx, file_idx = 0, 0
+            from_timestamp = 0.0
+            target_path = self.root / "videos" / video_key / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mkv"
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(temp_path), str(target_path))
-            shutil.rmtree(str(temp_path.parent))
+            shutil.move(str(ep_path), str(target_path))
+        else:
+            latest_path, chunk_idx, file_idx = latest
+            latest_size_in_mb = get_file_size_in_mb(latest_path)
+            latest_duration_in_s = get_video_duration_in_s(latest_path)
+
+            if latest_size_in_mb + ep_size_in_mb >= self.meta.video_files_size_in_mb:
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                from_timestamp = 0.0
+                target_path = self.root / "videos" / video_key / f"chunk-{chunk_idx:03d}" / f"file-{file_idx:03d}.mkv"
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(ep_path), str(target_path))
+            else:
+                from_timestamp = latest_duration_in_s
+                concatenate_depth_video_files([latest_path, ep_path], latest_path)
+
+        shutil.rmtree(str(ep_path.parent), ignore_errors=True)
+
+        metadata = {
+            "episode_index": episode_index,
+            f"videos/{video_key}/chunk_index": chunk_idx,
+            f"videos/{video_key}/file_index": file_idx,
+            f"videos/{video_key}/from_timestamp": from_timestamp,
+            f"videos/{video_key}/to_timestamp": from_timestamp + ep_duration_in_s,
+        }
+        return metadata
+    
+    # def _archive_episode_depth_videos(self, episode_index: int) -> None:
+    #     """Archive each depth stream as a lossless FFV1 MKV file for this episode."""
+    #     for depth_key in self.meta.depth_keys:
+    #         temp_path = _encode_depth_video_worker_lossless(depth_key, episode_index, self.root, self.fps)
+    #         # target_path = self.root / "depth_videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+    #         target_path = self.root / "videos" / depth_key / f"episode-{episode_index:06d}.mkv"
+    #         target_path.parent.mkdir(parents=True, exist_ok=True)
+    #         shutil.move(str(temp_path), str(target_path))
+    #         shutil.rmtree(str(temp_path.parent))
 
     def clear_episode_buffer(self, delete_images: bool = True, delete_depth_images: bool = False) -> None:
         # Clean up image files for the current episode buffer

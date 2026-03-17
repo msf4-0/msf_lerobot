@@ -42,6 +42,7 @@ from lerobot.datasets.utils import (
     write_tasks,
 )
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
+from lerobot.datasets.video_utils import concatenate_depth_video_files
 
 
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
@@ -229,7 +230,6 @@ def update_meta_data(
 
     return df
 
-
 def aggregate_datasets(
     repo_ids: list[str],
     aggr_repo_id: str,
@@ -274,6 +274,7 @@ def aggregate_datasets(
     )
     fps, robot_type, features = validate_all_metadata(all_metadata)
     video_keys = [key for key in features if features[key]["dtype"] == "video"]
+    depth_video_keys = [key for key in features if features[key]["dtype"] == "depth"]
 
     dst_meta = LeRobotDatasetMetadata.create(
         repo_id=aggr_repo_id,
@@ -281,7 +282,7 @@ def aggregate_datasets(
         robot_type=robot_type,
         features=features,
         root=aggr_root,
-        use_videos=len(video_keys) > 0,
+        use_videos=len(video_keys) > 0 or len(depth_video_keys) > 0,
         chunks_size=chunk_size,
         data_files_size_in_mb=data_files_size_in_mb,
         video_files_size_in_mb=video_files_size_in_mb,
@@ -298,14 +299,26 @@ def aggregate_datasets(
     videos_idx = {
         key: {"chunk": 0, "file": 0, "latest_duration": 0, "episode_duration": 0} for key in video_keys
     }
+    depth_videos_idx = {
+        key: {"chunk": 0, "file": 0, "latest_duration": 0, "episode_duration": 0}
+        for key in depth_video_keys
+    }
 
     dst_meta.episodes = {}
 
     for src_meta in tqdm.tqdm(all_metadata, desc="Copy data and videos"):
         videos_idx = aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size)
+        depth_videos_idx = aggregate_depth_videos(
+            src_meta,
+            dst_meta,
+            depth_videos_idx,
+            video_files_size_in_mb,
+            chunk_size,
+        )
         data_idx = aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size)
 
-        meta_idx = aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx)
+        all_videos_idx = {**videos_idx, **depth_videos_idx}
+        meta_idx = aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, all_videos_idx)
 
         # Clear the src_to_dst mapping after processing each source dataset
         # to avoid interference between different source datasets
@@ -417,6 +430,105 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                     dst_path,
                 )
                 # Update duration of this destination file
+                dst_file_durations[dst_key] = current_dst_duration + src_duration
+
+            videos_idx[key]["episode_duration"] += src_duration
+
+        videos_idx[key]["chunk"] = chunk_idx
+        videos_idx[key]["file"] = file_idx
+
+    return videos_idx
+
+
+def aggregate_depth_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size):
+    """Aggregates depth video chunks from a source dataset into the destination dataset.
+
+    Handles MKV depth video file concatenation and rotation based on file size limits.
+    Creates new depth video files when size limits are exceeded.
+
+    Args:
+        src_meta: Source dataset metadata.
+        dst_meta: Destination dataset metadata.
+        videos_idx: Dictionary tracking depth video chunk and file indices.
+        video_files_size_in_mb: Maximum size for video files in MB.
+        chunk_size: Maximum number of files per chunk.
+
+    Returns:
+        dict: Updated videos_idx with current chunk and file indices.
+    """
+    depth_video_path = DEFAULT_VIDEO_PATH.replace(".mp4", ".mkv")
+
+    for key in videos_idx:
+        videos_idx[key]["episode_duration"] = 0
+        videos_idx[key]["src_to_offset"] = {}
+        videos_idx[key]["src_to_dst"] = {}
+        if "dst_file_durations" not in videos_idx[key]:
+            videos_idx[key]["dst_file_durations"] = {}
+
+    for key, video_idx in videos_idx.items():
+        unique_chunk_file_pairs = {
+            (chunk, file)
+            for chunk, file in zip(
+                src_meta.episodes[f"videos/{key}/chunk_index"],
+                src_meta.episodes[f"videos/{key}/file_index"],
+                strict=False,
+            )
+        }
+        unique_chunk_file_pairs = sorted(unique_chunk_file_pairs)
+
+        chunk_idx = video_idx["chunk"]
+        file_idx = video_idx["file"]
+        dst_file_durations = video_idx["dst_file_durations"]
+
+        for src_chunk_idx, src_file_idx in unique_chunk_file_pairs:
+            src_path = src_meta.root / depth_video_path.format(
+                video_key=key,
+                chunk_index=src_chunk_idx,
+                file_index=src_file_idx,
+            )
+
+            dst_path = dst_meta.root / depth_video_path.format(
+                video_key=key,
+                chunk_index=chunk_idx,
+                file_index=file_idx,
+            )
+
+            src_duration = get_video_duration_in_s(src_path)
+            dst_key = (chunk_idx, file_idx)
+
+            if not dst_path.exists():
+                videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
+                videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(str(src_path), str(dst_path))
+                dst_file_durations[dst_key] = src_duration
+                videos_idx[key]["episode_duration"] += src_duration
+                continue
+
+            src_size = get_file_size_in_mb(src_path)
+            dst_size = get_file_size_in_mb(dst_path)
+
+            if dst_size + src_size >= video_files_size_in_mb:
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, chunk_size)
+                dst_key = (chunk_idx, file_idx)
+                videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
+                videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
+                dst_path = dst_meta.root / depth_video_path.format(
+                    video_key=key,
+                    chunk_index=chunk_idx,
+                    file_index=file_idx,
+                )
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(str(src_path), str(dst_path))
+                dst_file_durations[dst_key] = src_duration
+            else:
+                current_dst_duration = dst_file_durations.get(dst_key, 0)
+                videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = current_dst_duration
+                videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
+                concatenate_depth_video_files(
+                    [dst_path, src_path],
+                    dst_path,
+                )
                 dst_file_durations[dst_key] = current_dst_duration + src_duration
 
             videos_idx[key]["episode_duration"] += src_duration

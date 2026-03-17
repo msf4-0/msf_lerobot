@@ -164,10 +164,10 @@ import draccus
 
 from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
-    convert_image_to_video_dataset,
+    # convert_image_to_video_dataset,
     delete_episodes,
     merge_datasets,
-    modify_tasks,
+    # modify_tasks,
     remove_feature,
     split_dataset,
 )
@@ -592,11 +592,12 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
-    elif operation_type == "modify_tasks":
-        handle_modify_tasks(cfg)
-    elif operation_type == "convert_image_to_video":
-        handle_convert_image_to_video(cfg)
-    elif operation_type == "info":
+    # TODO: Restore implementation of the following operations after refactoring:
+    # elif operation_type == "modify_tasks":
+    #     handle_modify_tasks(cfg)
+    # elif operation_type == "convert_image_to_video":
+    #     handle_convert_image_to_video(cfg)
+    # elif operation_type == "info":
         handle_info(cfg)
     else:
         available = ", ".join(OperationConfig.get_known_choices())

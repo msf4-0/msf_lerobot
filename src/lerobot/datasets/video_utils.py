@@ -17,6 +17,7 @@ import contextlib
 import glob
 import importlib
 import logging
+import os
 import queue
 import shutil
 import tempfile
@@ -27,6 +28,7 @@ from fractions import Fraction
 from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
+import subprocess
 
 import av
 import fsspec
@@ -566,6 +568,66 @@ def concatenate_video_files(
     shutil.move(tmp_output_video_path, output_video_path)
     Path(tmp_concatenate_path).unlink()
 
+def get_ffmpeg_executable() -> str:
+    """Resolve ffmpeg path with robust fallbacks.
+
+    Priority:
+    1) LEROBOT_FFMPEG_PATH env var
+    2) imageio-ffmpeg bundled binary (static, avoids missing system libs)
+    3) system ffmpeg on PATH
+    """
+    custom_ffmpeg = os.environ.get("LEROBOT_FFMPEG_PATH")
+    if custom_ffmpeg:
+        return custom_ffmpeg
+
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+
+        return get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+    
+def concatenate_depth_video_files(
+    input_video_paths: list[Path | str],
+    output_video_path: Path | str,
+) -> None:
+    """
+    Concatenate files with ffmpeg concat demuxer + stream copy.
+    Works for MKV/FFV1 without re-encoding.
+    """
+    output_video_path = Path(output_video_path)
+    if len(input_video_paths) == 0:
+        raise FileNotFoundError("No input video paths provided.")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as f:
+        f.write("ffconcat version 1.0\n")
+        for p in input_video_paths:
+            f.write(f"file '{Path(p).resolve()}'\n")
+        concat_file = Path(f.name)
+
+    tmp_out = Path(tempfile.mkdtemp(dir=output_video_path.parent)) / output_video_path.name
+    cmd = [
+        get_ffmpeg_executable(),
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_file),
+        "-c",
+        "copy",
+        str(tmp_out),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+        output_video_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp_out), str(output_video_path))
+    finally:
+        with contextlib.suppress(Exception):
+            concat_file.unlink()
+        with contextlib.suppress(Exception):
+            shutil.rmtree(tmp_out.parent)
 
 class _CameraEncoderThread(threading.Thread):
     """A thread that encodes video frames streamed via a queue into an MP4 file.

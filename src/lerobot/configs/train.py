@@ -26,6 +26,7 @@ from lerobot import envs
 from lerobot.configs import parser
 from lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import NormalizationMode
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
@@ -76,6 +77,11 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Optional explicit list of visual observation keys that correspond to depth images.
+    # If empty, depth keys are inferred from dataset metadata when available.
+    depth_feature_keys: list[str] = field(default_factory=list)
+    # Optional normalization mode override applied only to depth_feature_keys.
+    depth_normalization_mode: NormalizationMode | None = None
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:

@@ -44,6 +44,7 @@ meta/, data/, videos/. When omitted, defaults to $HF_LEROBOT_HOME/{repo_id}.
 ```
 
 """
+# NOTE: Currently this does not support datasets with depth videos, but it can be adapted to do so if needed. The main missing piece is that we would need to add depth video info (chunk/file indices, timestamps) to the episode metadata and update the concatenate_videos function to also concatenate depth videos.
 
 import argparse
 import logging

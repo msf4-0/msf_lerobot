@@ -36,6 +36,7 @@ from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.processor.normalize_processor import NormalizerProcessorStep
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -150,6 +151,119 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def resolve_depth_feature_keys(cfg: TrainPipelineConfig, dataset) -> tuple[list[str], list[str]]:
+    """Resolve depth feature keys from CLI/config or infer from dataset metadata.
+
+    Returns a tuple of:
+    - raw depth keys as present in the dataset
+    - mapped depth keys after applying rename_map (keys seen by the policy preprocessor)
+    """
+    inferred_depth_feature_keys = [
+        key
+        for key, feature in dataset.meta.features.items()
+        if isinstance(feature, dict) and feature.get("dtype") == "depth"
+    ]
+    # Explicit config takes precedence over dataset inference.
+    raw_depth_feature_keys = cfg.depth_feature_keys or inferred_depth_feature_keys
+    unknown_depth_keys = [key for key in raw_depth_feature_keys if key not in dataset.meta.features]
+    if unknown_depth_keys:
+        raise ValueError(
+            "Invalid depth_feature_keys. The following keys are not present in dataset features: "
+            f"{unknown_depth_keys}"
+        )
+
+    mapped_depth_feature_keys = [cfg.rename_map.get(key, key) for key in raw_depth_feature_keys]
+    return raw_depth_feature_keys, mapped_depth_feature_keys
+
+
+def resolve_depth_global_min_max(dataset, depth_feature_keys: list[str]) -> dict[str, tuple[float, float]]:
+    """Resolve per-key global depth min/max from dataset metadata stats."""
+    depth_global_min_max: dict[str, tuple[float, float]] = {}
+    for key in depth_feature_keys:
+        stats = dataset.meta.stats.get(key)
+        if not isinstance(stats, dict):
+            continue
+        if "min" not in stats or "max" not in stats:
+            continue
+
+        global_min = torch.as_tensor(stats["min"], dtype=torch.float32).amin().item()
+        global_max = torch.as_tensor(stats["max"], dtype=torch.float32).amax().item()
+        if global_max <= global_min:
+            continue
+        depth_global_min_max[key] = (global_min, global_max)
+
+    return depth_global_min_max
+
+
+def apply_depth_normalization_override(
+    preprocessor,
+    depth_feature_keys: list[str],
+    depth_normalization_mode,
+) -> None:
+    """Apply per-key normalization override for depth features on the normalizer step."""
+    if not depth_feature_keys or depth_normalization_mode is None:
+        return
+
+    for step in preprocessor.steps:
+        if isinstance(step, NormalizerProcessorStep):
+            existing_key_norm_map = step.key_norm_map or {}
+            step.key_norm_map = {
+                **existing_key_norm_map,
+                **{key: depth_normalization_mode for key in depth_feature_keys},
+            }
+            return
+
+
+def preprocess_depth_images(
+    batch: dict[str, Any],
+    depth_feature_keys: list[str],
+    depth_global_min_max: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """Normalize depth images to [0, 1] and replicate single-channel depth to 3 channels.
+
+    This runs on raw dataset keys before the policy preprocessor pipeline.
+    Supports depth tensors shaped as (B, T, C, H, W) or (B, C, H, W).
+    Uses dataset-level global min/max when available; otherwise falls back to per-sample min/max.
+    """
+    if not depth_feature_keys:
+        return batch
+
+    for key in depth_feature_keys:
+        depth = batch.get(key)
+        if not isinstance(depth, torch.Tensor):
+            continue
+
+        global_min = None
+        global_max = None
+        if depth_global_min_max is not None and key in depth_global_min_max:
+            global_min, global_max = depth_global_min_max[key]
+
+        if depth.ndim == 5 and depth.shape[2] == 1:
+            depth = depth.to(dtype=torch.float32)
+            if global_min is not None and global_max is not None:
+                depth = (depth - global_min) / max(global_max - global_min, 1e-6)
+            else:
+                depth_min = depth.amin(dim=(-2, -1), keepdim=True)
+                depth_max = depth.amax(dim=(-2, -1), keepdim=True)
+                depth = (depth - depth_min) / (depth_max - depth_min).clamp_min(1e-6)
+            depth = depth.clamp(0.0, 1.0)
+            depth = depth.repeat(1, 1, 3, 1, 1)
+            batch[key] = depth
+        elif depth.ndim == 4 and depth.shape[1] == 1:
+            depth = depth.to(dtype=torch.float32)
+            if global_min is not None and global_max is not None:
+                depth = (depth - global_min) / max(global_max - global_min, 1e-6)
+            else:
+                depth_min = depth.amin(dim=(-2, -1), keepdim=True)
+                depth_max = depth.amax(dim=(-2, -1), keepdim=True)
+                depth = (depth - depth_min) / (depth_max - depth_min).clamp_min(1e-6)
+            depth = depth.clamp(0.0, 1.0)
+            depth = depth.repeat(1, 3, 1, 1)
+            batch[key] = depth
+
+    return batch
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -223,6 +337,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    raw_depth_feature_keys, mapped_depth_feature_keys = resolve_depth_feature_keys(cfg, dataset)
+    depth_global_min_max = resolve_depth_global_min_max(dataset, raw_depth_feature_keys)
+    if is_main_process and raw_depth_feature_keys:
+        logging.info(f"Depth feature keys (dataset): {raw_depth_feature_keys}")
+        if mapped_depth_feature_keys != raw_depth_feature_keys:
+            logging.info(f"Depth feature keys (after rename_map): {mapped_depth_feature_keys}")
+        logging.info(
+            "Applying depth image preprocessing in train/eval loops: global min-max normalization "
+            "to [0, 1] and single-channel to 3-channel replication."
+        )
+        missing_global_stats = [key for key in raw_depth_feature_keys if key not in depth_global_min_max]
+        if missing_global_stats:
+            logging.warning(
+                "Missing global depth min/max stats for keys %s; falling back to per-sample min-max for those.",
+                missing_global_stats,
+            )
+        if cfg.depth_normalization_mode is not None:
+            logging.info(
+                "Applying depth normalization mode override: "
+                f"{cfg.depth_normalization_mode.value} for keys {mapped_depth_feature_keys}"
+            )
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -284,6 +420,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         pretrained_path=cfg.policy.pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
+    )
+    apply_depth_normalization_override(
+        preprocessor=preprocessor,
+        depth_feature_keys=mapped_depth_feature_keys,
+        depth_normalization_mode=cfg.depth_normalization_mode,
     )
 
     if is_main_process:
@@ -407,6 +548,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        batch = preprocess_depth_images(
+            batch, raw_depth_feature_keys, depth_global_min_max=depth_global_min_max
+        )
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -487,6 +631,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        depth_feature_keys=raw_depth_feature_keys,
+                        depth_global_min_max=depth_global_min_max,
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]

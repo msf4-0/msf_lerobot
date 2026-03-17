@@ -1197,8 +1197,9 @@ class PI0Policy(PreTrainedPolicy):
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
 
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+            # Handle both [B, C, H, W] and [B, H, W, C] formats.
+            # Treat 1-channel and 3-channel tensors as valid visual inputs.
+            is_channels_first = img.ndim == 4 and img.shape[1] in (1, 3)
 
             if is_channels_first:
                 # Convert [B, C, H, W] to [B, H, W, C] for processing

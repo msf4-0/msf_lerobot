@@ -92,6 +92,55 @@ from lerobot.utils.utils import (
 )
 
 
+def preprocess_depth_images(
+    batch: dict[str, Any],
+    depth_feature_keys: list[str] | None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """Normalize depth images to [0, 1] and replicate single-channel depth to 3 channels.
+
+    Supports depth tensors shaped as (B, T, C, H, W) or (B, C, H, W).
+    Uses dataset-level global min/max when available; otherwise falls back to per-sample min/max.
+    """
+    if not depth_feature_keys:
+        return batch
+
+    for key in depth_feature_keys:
+        depth = batch.get(key)
+        if not isinstance(depth, torch.Tensor):
+            continue
+
+        global_min = None
+        global_max = None
+        if depth_global_min_max is not None and key in depth_global_min_max:
+            global_min, global_max = depth_global_min_max[key]
+
+        if depth.ndim == 5 and depth.shape[2] == 1:
+            depth = depth.to(dtype=torch.float32)
+            if global_min is not None and global_max is not None:
+                depth = (depth - global_min) / max(global_max - global_min, 1e-6)
+            else:
+                depth_min = depth.amin(dim=(-2, -1), keepdim=True)
+                depth_max = depth.amax(dim=(-2, -1), keepdim=True)
+                depth = (depth - depth_min) / (depth_max - depth_min).clamp_min(1e-6)
+            depth = depth.clamp(0.0, 1.0)
+            depth = depth.repeat(1, 1, 3, 1, 1)
+            batch[key] = depth
+        elif depth.ndim == 4 and depth.shape[1] == 1:
+            depth = depth.to(dtype=torch.float32)
+            if global_min is not None and global_max is not None:
+                depth = (depth - global_min) / max(global_max - global_min, 1e-6)
+            else:
+                depth_min = depth.amin(dim=(-2, -1), keepdim=True)
+                depth_max = depth.amax(dim=(-2, -1), keepdim=True)
+                depth = (depth - depth_min) / (depth_max - depth_min).clamp_min(1e-6)
+            depth = depth.clamp(0.0, 1.0)
+            depth = depth.repeat(1, 3, 1, 1)
+            batch[key] = depth
+
+    return batch
+
+
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -99,6 +148,8 @@ def rollout(
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    depth_feature_keys: list[str] | None = None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None = None,
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
@@ -171,6 +222,11 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+        observation = preprocess_depth_images(
+            observation,
+            depth_feature_keys=depth_feature_keys,
+            depth_global_min_max=depth_global_min_max,
+        )
 
         observation = preprocessor(observation)
         with torch.inference_mode():
@@ -255,6 +311,8 @@ def eval_policy(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    depth_feature_keys: list[str] | None = None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None = None,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
@@ -343,6 +401,8 @@ def eval_policy(
             env_postprocessor=env_postprocessor,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
+            depth_feature_keys=depth_feature_keys,
+            depth_global_min_max=depth_global_min_max,
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
@@ -599,6 +659,8 @@ def eval_one(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     n_episodes: int,
+    depth_feature_keys: list[str] | None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None,
     max_episodes_rendered: int,
     videos_dir: Path | None,
     return_episode_data: bool,
@@ -616,6 +678,8 @@ def eval_one(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        depth_feature_keys=depth_feature_keys,
+        depth_global_min_max=depth_global_min_max,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
@@ -642,6 +706,8 @@ def run_one(
     preprocessor,
     postprocessor,
     n_episodes: int,
+    depth_feature_keys: list[str] | None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None,
     max_episodes_rendered: int,
     videos_dir: Path | None,
     return_episode_data: bool,
@@ -666,6 +732,8 @@ def run_one(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        depth_feature_keys=depth_feature_keys,
+        depth_global_min_max=depth_global_min_max,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
@@ -691,6 +759,8 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    depth_feature_keys: list[str] | None = None,
+    depth_global_min_max: dict[str, tuple[float, float]] | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -742,6 +812,8 @@ def eval_policy_all(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         n_episodes=n_episodes,
+        depth_feature_keys=depth_feature_keys,
+        depth_global_min_max=depth_global_min_max,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,

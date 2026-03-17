@@ -93,6 +93,7 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
+    key_norm_map: dict[str, NormalizationMode] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -125,6 +126,9 @@ class _NormalizationMixin:
             for ft_type_str, norm_mode_str in self.norm_map.items():
                 reconstructed[FeatureType(ft_type_str)] = NormalizationMode(norm_mode_str)
             self.norm_map = reconstructed
+
+        if self.key_norm_map and all(isinstance(v, str) for v in self.key_norm_map.values()):
+            self.key_norm_map = {key: NormalizationMode(mode) for key, mode in self.key_norm_map.items()}
 
         # Convert stats to tensors and move to the target device once during initialization.
         self.stats = self.stats or {}
@@ -237,6 +241,8 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
+        if self.key_norm_map is not None:
+            config["key_norm_map"] = {key: mode.value for key, mode in self.key_norm_map.items()}
         return config
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
@@ -303,6 +309,8 @@ class _NormalizationMixin:
             ValueError: If an unsupported normalization mode is encountered.
         """
         norm_mode = self.norm_map.get(feature_type, NormalizationMode.IDENTITY)
+        if self.key_norm_map is not None and key in self.key_norm_map:
+            norm_mode = self.key_norm_map[key]
         if norm_mode == NormalizationMode.IDENTITY or key not in self._tensor_stats:
             return tensor
 
