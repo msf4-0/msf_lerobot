@@ -52,6 +52,11 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.robots import (
     RobotConfig,  # noqa: F401
     make_robot_from_config,
+    bi_so_follower,
+    koch_follower,
+    lekiwi,
+    omx_follower,
+    so_follower,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -87,6 +92,7 @@ class RobotClient:
         """
         # Store configuration
         self.config = config
+        print(config.robot)
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
 
